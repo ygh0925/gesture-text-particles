@@ -292,6 +292,7 @@ let mode = 'normal';
 
 let compress = 0;          // 压缩系数 0~1(平滑)
 let compressTarget = 0;
+let twoHandsActive = false; // 双手交互中:粒子运动实时跟随手速
 let orbFrames = 0;         // 处于对握距离内的帧数
 let orbReady = false;      // 已进入"对握最小"状态
 let prevHandDist = null;
@@ -328,6 +329,7 @@ function countFingers(lm) {
 
 function handleGestureFrame(results) {
   const hands = results.multiHandLandmarks || [];
+  twoHandsActive = hands.length === 2 && mode !== 'explode' && mode !== 'message';
 
   /* ---------- 双手:压缩/对握/爆炸 状态机 ---------- */
   if (hands.length === 2 && mode !== 'explode' && mode !== 'message') {
@@ -410,7 +412,8 @@ function animate() {
   const dt = Math.min(clock.getDelta(), 0.05);
   const t = clock.elapsedTime;
 
-  compress += (compressTarget - compress) * 0.12;
+  // 双手交互时压缩值几乎实时跟随手距(只留一点点平滑去抖),粒子速度与手速一致
+  compress += (compressTarget - compress) * (twoHandsActive ? 0.6 : 0.12);
 
   const posAttr = geometry.attributes.position;
 
@@ -432,8 +435,8 @@ function animate() {
       switchDisplay('msg');
     }
   } else {
-    // 缓动飞向目标(带压缩)
-    const k = display === 'float' ? 0.025 : 0.07;
+    // 缓动飞向目标(带压缩);双手交互时用高追踪系数,粒子紧贴手的快慢
+    const k = twoHandsActive ? 0.35 : (display === 'float' ? 0.025 : 0.07);
     const shrink = 1 - compress * 0.93;
     const jitter = compress > 0.9 ? 0.5 : 0; // 蓄能颤动
     for (let i = 0; i < PARTICLE_COUNT; i++) {
