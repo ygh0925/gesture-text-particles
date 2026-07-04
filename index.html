@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>手势粒子 · 生日惊喜</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: #07071c;
+    touch-action: manipulation;
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    -webkit-user-select: none; user-select: none;
+  }
+  #scene { position: fixed; inset: 0; display: block; }
+
+  /* 摄像头小窗(右下角) */
+  #camWrap {
+    position: fixed; right: 12px; bottom: 12px;
+    width: 150px; height: 112px;
+    border-radius: 14px; overflow: hidden;
+    border: 1.5px solid rgba(255,255,255,.35);
+    background: rgba(0,0,0,.4);
+    box-shadow: 0 4px 24px rgba(0,0,0,.5);
+    opacity: 0; transition: opacity .6s;
+    z-index: 5;
+  }
+  #camWrap.show { opacity: 1; }
+  #video {
+    width: 100%; height: 100%; object-fit: cover;
+    transform: scaleX(-1); /* 镜像 */
+  }
+
+  /* 开始界面 */
+  #startOverlay {
+    position: fixed; inset: 0; z-index: 20;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background: radial-gradient(ellipse at 50% 40%, #1a1a4a 0%, #0a0a24 60%, #050514 100%);
+    transition: opacity .8s;
+  }
+  #startOverlay.hide { opacity: 0; pointer-events: none; }
+  #startOverlay h1 {
+    color: #ffd9ec; font-size: clamp(22px, 5vw, 36px);
+    font-weight: 700; letter-spacing: 4px; margin-bottom: 10px;
+    text-shadow: 0 0 24px rgba(255,150,210,.6);
+  }
+  #startOverlay p { color: rgba(255,255,255,.55); font-size: 14px; margin-bottom: 40px; letter-spacing: 2px; }
+  #startBtn {
+    padding: 16px 52px; font-size: 20px; letter-spacing: 6px;
+    color: #fff; background: linear-gradient(135deg, #ff7eb3, #a78bfa);
+    border: none; border-radius: 999px; cursor: pointer;
+    box-shadow: 0 6px 30px rgba(255,126,179,.45);
+    transition: transform .15s;
+  }
+  #startBtn:active { transform: scale(.95); }
+
+  /* 加载提示 */
+  #loading {
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%);
+    z-index: 15; color: #ffd9ec; font-size: 16px; letter-spacing: 3px;
+    background: rgba(10,10,40,.7); padding: 14px 30px; border-radius: 12px;
+    display: none;
+  }
+  #loading.show { display: block; }
+
+  /* 操作提示 */
+  #hint {
+    position: fixed; left: 12px; bottom: 12px; z-index: 5;
+    color: rgba(255,255,255,.55); font-size: 12px; line-height: 1.7;
+    background: rgba(10,10,40,.45); padding: 8px 14px; border-radius: 10px;
+    letter-spacing: 1px; opacity: 0; transition: opacity .6s;
+    max-width: min(60vw, 320px);
+  }
+  #hint.show { opacity: 1; }
+
+  #errMsg {
+    position: fixed; left: 50%; top: 20%; transform: translateX(-50%);
+    z-index: 30; color: #ffb3b3; font-size: 14px; text-align: center;
+    background: rgba(60,10,20,.85); padding: 14px 22px; border-radius: 12px;
+    display: none; max-width: 80vw; line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+
+<div id="camWrap"><video id="video" playsinline muted autoplay></video></div>
+
+<div id="startOverlay">
+  <h1>✨ 手势粒子星空 ✨</h1>
+  <p>需要使用前置摄像头识别手势</p>
+  <button id="startBtn">开 始</button>
+</div>
+
+<div id="loading">模型加载中…</div>
+<div id="hint">伸出 1~4 根手指试试<br>双手合拢再张开有惊喜 ✨</div>
+<div id="errMsg"></div>
+
+<!-- 第三方库(已本地化,不依赖外部 CDN,国内网络可用) -->
+<script src="./vendor/three.min.js"></script>
+<script src="./vendor/camera_utils.js"></script>
+<script src="./vendor/hands/hands.js"></script>
+
+<script>
+"use strict";
+
+/* ============================================================
+ * 基础配置
+ * ============================================================ */
+const IS_MOBILE = /iPhone|iPad|Android/i.test(navigator.userAgent)
+  || (navigator.maxTouchPoints > 1 && /Mac/.test(navigator.userAgent)); // iPadOS 伪装 Mac
+const PARTICLE_COUNT = IS_MOBILE ? 12000 : 22000;
+const STABLE_FRAMES = 15;         // 手势稳定帧数(约0.5s)
+const ORB_DIST      = 0.13;       // 双手对握距离阈值(归一化)
+const COMPRESS_MAX_DIST = 0.55;   // 开始压缩的最大距离
+const EXPLODE_SPEED = 0.028;      // 触发爆炸的双手分离速度(每帧)
+
+/* ============================================================
+ * Three.js 场景
+ * ============================================================ */
+const canvas = document.getElementById('scene');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, alpha: false });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setClearColor(0x07071c, 1);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x07071c, 0.004);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 500);
+camera.position.z = 60;
+
+// 深蓝紫夜空渐变背景(大球体内壁)
+(function makeSky() {
+  const c = document.createElement('canvas');
+  c.width = 2; c.height = 256;
+  const g = c.getContext('2d');
+  const grad = g.createLinearGradient(0, 0, 0, 256);
+  grad.addColorStop(0, '#1b1140');
+  grad.addColorStop(0.5, '#0d0a2e');
+  grad.addColorStop(1, '#05051a');
+  g.fillStyle = grad; g.fillRect(0, 0, 2, 256);
+  const tex = new THREE.CanvasTexture(c);
+  const sky = new THREE.Mesh(
+    new THREE.SphereGeometry(300, 16, 16),
+    new THREE.MeshBasicMaterial({ map: tex, side: THREE.BackSide, fog: false })
+  );
+  scene.add(sky);
+})();
+
+// 发光圆点贴图
+function makeSprite() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 64;
+  const g = c.getContext('2d');
+  const grad = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  grad.addColorStop(0, 'rgba(255,255,255,1)');
+  grad.addColorStop(0.3, 'rgba(255,235,245,.85)');
+  grad.addColorStop(0.7, 'rgba(255,200,230,.25)');
+  grad.addColorStop(1, 'rgba(255,200,230,0)');
+  g.fillStyle = grad; g.fillRect(0, 0, 64, 64);
+  return new THREE.CanvasTexture(c);
+}
+
+/* ---------- 粒子系统 ---------- */
+const positions  = new Float32Array(PARTICLE_COUNT * 3); // 当前位置
+const targets    = new Float32Array(PARTICLE_COUNT * 3); // 目标位置
+const velocities = new Float32Array(PARTICLE_COUNT * 3); // 爆炸速度
+const colors     = new Float32Array(PARTICLE_COUNT * 3);
+const homePos    = new Float32Array(PARTICLE_COUNT * 3); // 自由漂浮基准位置
+const phase      = new Float32Array(PARTICLE_COUNT);     // 漂浮相位
+
+// 樱花系配色
+const PALETTE = [
+  [1.00, 0.72, 0.84], // 粉
+  [1.00, 0.88, 0.93], // 浅粉白
+  [0.95, 0.95, 1.00], // 白
+  [0.80, 0.72, 1.00], // 淡紫
+  [1.00, 0.85, 0.60], // 暖金
+];
+
+for (let i = 0; i < PARTICLE_COUNT; i++) {
+  const r = 30 + Math.random() * 90;
+  const th = Math.random() * Math.PI * 2;
+  const ph = Math.acos(2 * Math.random() - 1);
+  const x = r * Math.sin(ph) * Math.cos(th);
+  const y = r * Math.sin(ph) * Math.sin(th) * 0.6;
+  const z = r * Math.cos(ph) * 0.5 - 10;
+  homePos[i*3] = x; homePos[i*3+1] = y; homePos[i*3+2] = z;
+  positions[i*3] = x; positions[i*3+1] = y; positions[i*3+2] = z;
+  targets[i*3] = x; targets[i*3+1] = y; targets[i*3+2] = z;
+  phase[i] = Math.random() * Math.PI * 2;
+  const col = PALETTE[(Math.random() * PALETTE.length) | 0];
+  colors[i*3] = col[0]; colors[i*3+1] = col[1]; colors[i*3+2] = col[2];
+}
+
+const geometry = new THREE.BufferGeometry();
+geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+const material = new THREE.PointsMaterial({
+  size: 0.9,
+  map: makeSprite(),
+  vertexColors: true,
+  transparent: true,
+  opacity: 0.9,
+  depthWrite: false,
+  blending: THREE.AdditiveBlending,
+  sizeAttenuation: true,
+});
+scene.add(new THREE.Points(geometry, material));
+
+/* ============================================================
+ * 文字 → 粒子目标点采样
+ * ============================================================ */
+function sampleTextPoints(lines, big) {
+  const fontSize = 220;
+  const lineGap = fontSize * 1.18;
+  const c = document.createElement('canvas');
+  const g = c.getContext('2d');
+  const font = `900 ${fontSize}px "PingFang SC","Heiti SC","Microsoft YaHei",sans-serif`;
+  g.font = font;
+  let maxW = 0;
+  for (const ln of lines) maxW = Math.max(maxW, g.measureText(ln).width);
+  c.width = Math.ceil(maxW + 60);
+  c.height = Math.ceil(lineGap * lines.length + 60);
+  g.font = font;
+  g.fillStyle = '#fff';
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  lines.forEach((ln, i) => {
+    g.fillText(ln, c.width / 2, 30 + lineGap * (i + 0.5));
+  });
+
+  // 采样像素
+  const img = g.getImageData(0, 0, c.width, c.height).data;
+  const pts = [];
+  const step = big ? 4 : 5;
+  for (let y = 0; y < c.height; y += step) {
+    for (let x = 0; x < c.width; x += step) {
+      if (img[(y * c.width + x) * 4 + 3] > 120) {
+        pts.push([x - c.width / 2, -(y - c.height / 2)]);
+      }
+    }
+  }
+
+  // 缩放到可视区域
+  const visH = 2 * camera.position.z * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+  const visW = visH * camera.aspect;
+  const scale = Math.min(visW * 0.86 / c.width, visH * 0.62 / c.height);
+  for (const p of pts) { p[0] *= scale; p[1] *= scale; }
+  return pts;
+}
+
+function setTextTargets(text) {
+  let lines;
+  const portrait = window.innerHeight > window.innerWidth;
+  if (text === '__NAME__') {
+    lines = ['范冰倩', '生日快乐'];
+  } else if (text === '__MSG__') {
+    lines = portrait ? ['祝你每天', '都开心!'] : ['祝你每天都开心!'];
+  } else {
+    lines = [text];
+  }
+  const pts = sampleTextPoints(lines, text.length <= 2);
+  if (!pts.length) return;
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    const p = pts[i % pts.length];
+    targets[i*3]   = p[0] + (Math.random() - 0.5) * 0.5;
+    targets[i*3+1] = p[1] + (Math.random() - 0.5) * 0.5;
+    targets[i*3+2] = (Math.random() - 0.5) * 3;
+  }
+}
+
+function setFloatTargets() {
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    targets[i*3]   = homePos[i*3];
+    targets[i*3+1] = homePos[i*3+1];
+    targets[i*3+2] = homePos[i*3+2];
+  }
+}
+
+/* ============================================================
+ * 全局状态
+ * ============================================================ */
+// display: 当前展示内容 'float' | '1' | '2' | '3' | 'name' | 'msg'
+let display = 'float';
+// mode: 'normal' | 'orb' | 'explode' | 'message'
+let mode = 'normal';
+
+let compress = 0;          // 压缩系数 0~1(平滑)
+let compressTarget = 0;
+let orbFrames = 0;         // 处于对握距离内的帧数
+let orbReady = false;      // 已进入"对握最小"状态
+let prevHandDist = null;
+let explodeTime = 0;
+let messageTime = 0;
+
+function switchDisplay(d) {
+  if (display === d) return;
+  display = d;
+  if (d === 'float') setFloatTargets();
+  else if (d === 'name') setTextTargets('__NAME__');
+  else if (d === 'msg') setTextTargets('__MSG__');
+  else setTextTargets(d);
+}
+
+/* ============================================================
+ * 手势识别
+ * ============================================================ */
+let candidateGesture = -1; // 当前候选手势(手指数, 0=无手)
+let candidateFrames = 0;
+let stableGesture = 0;
+
+function countFingers(lm) {
+  let n = 0;
+  // 食指/中指/无名指/小指: 指尖高于 PIP 关节(图像 y 向下)
+  for (const tip of [8, 12, 16, 20]) {
+    if (lm[tip].y < lm[tip - 2].y) n++;
+  }
+  // 拇指: 与镜像/左右手无关的判断 —— 拇指伸展方向与"食指根→小指根"方向相反
+  const dir = Math.sign(lm[5].x - lm[17].x); // 手掌朝向
+  if (dir !== 0 && (lm[4].x - lm[3].x) * dir > 0.02) n++;
+  return n;
+}
+
+function handleGestureFrame(results) {
+  const hands = results.multiHandLandmarks || [];
+
+  /* ---------- 双手:压缩/对握/爆炸 状态机 ---------- */
+  if (hands.length === 2 && mode !== 'explode' && mode !== 'message') {
+    const a = hands[0][9], b = hands[1][9]; // 掌心
+    const d = Math.hypot(a.x - b.x, a.y - b.y);
+
+    // 压缩比例与距离实时绑定
+    compressTarget = THREE.MathUtils.clamp(
+      (COMPRESS_MAX_DIST - d) / (COMPRESS_MAX_DIST - ORB_DIST), 0, 1);
+
+    if (d < ORB_DIST) {
+      orbFrames++;
+      if (orbFrames > 6) { orbReady = true; mode = 'orb'; }
+    } else {
+      orbFrames = 0;
+    }
+
+    // 必须先对握到最小,再快速分开才爆炸
+    if (orbReady && prevHandDist !== null && (d - prevHandDist) > EXPLODE_SPEED && d > ORB_DIST * 1.4) {
+      triggerExplosion();
+    }
+    prevHandDist = d;
+    candidateGesture = -1; candidateFrames = 0; // 双手时不做单手识别
+    return;
+  }
+
+  // 双手离开: 复位压缩(爆炸/展示阶段不干预)
+  if (mode === 'orb' && hands.length < 2) {
+    // 对握后手移出画面: 缓慢泄压
+    orbFrames = 0;
+    if (compress < 0.15) { mode = 'normal'; orbReady = false; }
+  }
+  if (mode === 'normal') { compressTarget = 0; orbReady = false; orbFrames = 0; prevHandDist = null; }
+  if (mode === 'orb') compressTarget = 1;
+
+  /* ---------- 单手:手指数 → 文字 ---------- */
+  if (mode !== 'normal') return; // 爆炸/展示/蓄能期间不切换文字
+
+  let g = 0;
+  if (hands.length >= 1) g = countFingers(hands[0]);
+
+  if (g === candidateGesture) {
+    candidateFrames++;
+  } else {
+    candidateGesture = g;
+    candidateFrames = 1;
+  }
+  if (candidateFrames >= STABLE_FRAMES && g !== stableGesture) {
+    stableGesture = g;
+    if (g === 1) switchDisplay('1');
+    else if (g === 2) switchDisplay('2');
+    else if (g === 3) switchDisplay('3');
+    else if (g === 4) switchDisplay('name');
+    else switchDisplay('float'); // 0 或 5 指 → 星空
+  }
+}
+
+/* ---------- 爆炸 ---------- */
+function triggerExplosion() {
+  mode = 'explode';
+  explodeTime = 0;
+  orbReady = false; orbFrames = 0; prevHandDist = null;
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    const x = positions[i*3], y = positions[i*3+1], z = positions[i*3+2];
+    const len = Math.hypot(x, y, z) || 1;
+    const speed = 30 + Math.random() * 45;
+    velocities[i*3]   = (x / len) * speed + (Math.random() - 0.5) * 18;
+    velocities[i*3+1] = (y / len) * speed + (Math.random() - 0.5) * 18;
+    velocities[i*3+2] = (z / len) * speed + (Math.random() - 0.5) * 18;
+  }
+}
+
+/* ============================================================
+ * 渲染循环
+ * ============================================================ */
+const clock = new THREE.Clock();
+
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const t = clock.elapsedTime;
+
+  compress += (compressTarget - compress) * 0.12;
+
+  const posAttr = geometry.attributes.position;
+
+  if (mode === 'explode') {
+    explodeTime += dt;
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+      positions[i*3]   += velocities[i*3]   * dt;
+      positions[i*3+1] += velocities[i*3+1] * dt;
+      positions[i*3+2] += velocities[i*3+2] * dt;
+      velocities[i*3] *= 0.965; velocities[i*3+1] *= 0.965; velocities[i*3+2] *= 0.965;
+    }
+    material.opacity = Math.max(0.35, 1.2 - explodeTime * 0.7);
+    material.size = 1.4 - explodeTime * 0.3;
+    if (explodeTime > 1.3) {
+      mode = 'message';
+      messageTime = 0;
+      compress = 0; compressTarget = 0;
+      display = ''; // 强制刷新
+      switchDisplay('msg');
+    }
+  } else {
+    // 缓动飞向目标(带压缩)
+    const k = display === 'float' ? 0.025 : 0.07;
+    const shrink = 1 - compress * 0.93;
+    const jitter = compress > 0.9 ? 0.5 : 0; // 蓄能颤动
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+      let tx = targets[i*3] * shrink;
+      let ty = targets[i*3+1] * shrink;
+      let tz = targets[i*3+2] * shrink;
+      if (display === 'float') {
+        // 星空缓慢漂浮
+        tx += Math.sin(t * 0.3 + phase[i]) * 2.5;
+        ty += Math.cos(t * 0.22 + phase[i] * 1.3) * 2.0;
+      }
+      if (jitter) {
+        tx += (Math.random() - 0.5) * jitter;
+        ty += (Math.random() - 0.5) * jitter;
+      }
+      positions[i*3]   += (tx - positions[i*3])   * k;
+      positions[i*3+1] += (ty - positions[i*3+1]) * k;
+      positions[i*3+2] += (tz - positions[i*3+2]) * k;
+    }
+
+    // 亮度/大小随状态变化
+    let targetOpacity = 0.9, targetSize = 0.9;
+    if (compress > 0.05) {
+      targetOpacity = 0.9 + compress * 0.3;
+      targetSize = 0.9 + compress * 0.9;
+    }
+    if (mode === 'message') {
+      messageTime += dt;
+      targetOpacity = 0.9 + Math.sin(t * 14) * (messageTime < 2 ? 0.25 : 0.08); // 闪烁
+      if (messageTime > 6) { mode = 'normal'; stableGesture = -99; switchDisplay('float'); }
+    }
+    material.opacity += (targetOpacity - material.opacity) * 0.1;
+    material.size += (targetSize - material.size) * 0.1;
+  }
+
+  posAttr.needsUpdate = true;
+  scene.rotation.y = Math.sin(t * 0.05) * 0.03;
+  renderer.render(scene, camera);
+}
+animate();
+
+/* ============================================================
+ * 自适应 & 防缩放
+ * ============================================================ */
+function onResize() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  // 重新按新宽度排版当前文字
+  if (display !== 'float' && mode !== 'explode') {
+    const d = display; display = ''; switchDisplay(d);
+  }
+}
+window.addEventListener('resize', onResize);
+window.addEventListener('orientationchange', () => setTimeout(onResize, 300));
+document.addEventListener('dblclick', e => e.preventDefault(), { passive: false });
+document.addEventListener('gesturestart', e => e.preventDefault(), { passive: false });
+
+/* ============================================================
+ * 摄像头 + MediaPipe(需用户手势启动)
+ * ============================================================ */
+const startBtn = document.getElementById('startBtn');
+const overlay = document.getElementById('startOverlay');
+const loading = document.getElementById('loading');
+const errMsg = document.getElementById('errMsg');
+let modelLoaded = false;
+
+startBtn.addEventListener('click', async () => {
+  overlay.classList.add('hide');
+  loading.classList.add('show');
+
+  if (!window.isSecureContext) {
+    showError('当前页面不是 HTTPS,摄像头无法启动。\n请通过 https:// 链接访问(GitHub Pages / Vercel 部署后即可)。');
+    return;
+  }
+
+  try {
+    const video = document.getElementById('video');
+
+    const hands = new Hands({
+      locateFile: f => `./vendor/hands/${f}`,
+    });
+    hands.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 0,        // 移动端流畅优先
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.5,
+      selfieMode: true,          // 与镜像预览一致
+    });
+    hands.onResults(results => {
+      if (!modelLoaded) {
+        modelLoaded = true;
+        loading.classList.remove('show');
+        document.getElementById('camWrap').classList.add('show');
+        document.getElementById('hint').classList.add('show');
+      }
+      handleGestureFrame(results);
+    });
+
+    const cam = new Camera(video, {
+      onFrame: async () => { await hands.send({ image: video }); },
+      width: 640,
+      height: 480,
+      facingMode: 'user',
+    });
+    await cam.start();
+  } catch (err) {
+    showError('摄像头启动失败:' + (err && err.message ? err.message : err) +
+      '\n请确认已允许摄像头权限,并使用 Safari/Chrome 通过 HTTPS 访问。');
+  }
+});
+
+function showError(msg) {
+  loading.classList.remove('show');
+  errMsg.textContent = msg;
+  errMsg.style.display = 'block';
+  errMsg.style.whiteSpace = 'pre-line';
+}
+</script>
+</body>
+</html>
