@@ -95,7 +95,7 @@
 </div>
 
 <div id="loading">模型加载中…</div>
-<div id="hint">伸出 1~4 根手指试试<br>双手合拢再张开有惊喜 ✨</div>
+<div id="hint">伸出 1~4 根手指试试<br>左右移动手掌可转动画面<br>双手合拢再张开有惊喜 ✨</div>
 <div id="errMsg"></div>
 
 <!-- 第三方库(已本地化,不依赖外部 CDN,国内网络可用) -->
@@ -280,8 +280,7 @@ function spawnBalloon() {
   const b = balloons.find(x => !x.userData.active);
   if (!b) return;
   const u = b.userData;
-  // 文字模式:气球在文字后方升起,不遮字;照片铺满全屏时:气球飘在照片前面
-  const z = display === 'photo' ? 4 + Math.random() * 12 : -26 + Math.random() * 20;
+  const z = -30 + Math.random() * 16; // 在旋转结构外围的背景处升起,不遮内容
   const dist = camera.position.z - z;
   const halfH = dist * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
   const halfW = halfH * camera.aspect;
@@ -333,50 +332,50 @@ function setPhotoTargets() {
   if (!photoReady) return false;
   const visH = 2 * camera.position.z * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
   const visW = visH * camera.aspect;
-  // 粒子网格按屏幕比例分布,铺满全屏
-  let rows = Math.floor(Math.sqrt(PARTICLE_COUNT * visH / visW));
-  let cols = Math.floor(rows * visW / visH);
-  while (rows * cols > PARTICLE_COUNT) rows--;
-  // 照片按 cover 方式裁剪:短边撑满,超出部分裁掉(横竖屏都全屏)
-  const pw = photoImg.naturalWidth, ph = photoImg.naturalHeight;
-  const screenAspect = visW / visH;
-  let sx, sy, srcW, srcH;
-  if (pw / ph > screenAspect) {
-    srcH = ph; srcW = ph * screenAspect; sx = (pw - srcW) / 2; sy = 0;
-  } else {
-    srcW = pw; srcH = pw / screenAspect; sx = 0;
-    sy = (ph - srcH) * 0.32; // 竖图裁上下时偏向上方,保住脸部
-  }
+  // 四面结构:每面分到 1/4 的粒子,按照片比例组网格
+  const n4 = PARTICLE_COUNT >> 2;
+  const aspect = photoImg.naturalWidth / photoImg.naturalHeight;
+  let rows = Math.floor(Math.sqrt(n4 / aspect));
+  let cols = Math.floor(rows * aspect);
+  while (rows * cols > n4) rows--;
   const c = document.createElement('canvas');
   c.width = cols; c.height = rows;
   const g = c.getContext('2d');
-  g.drawImage(photoImg, sx, sy, srcW, srcH, 0, 0, cols, rows);
+  g.drawImage(photoImg, 0, 0, cols, rows);
   const px = g.getImageData(0, 0, cols, rows).data;
 
-  const spacing = visH / rows; // rows×spacing = 可视高度,正好铺满
+  const spacing = Math.min(visH * 0.62 / rows, visW * 0.5 / cols);
   photoDotSize = spacing * 2.0; // 点径大于间距,相互衔接铺满画面
+  const R = (cols * spacing) / 2 + 2; // 面到中心距离,四张照片围成方盒
 
   let idx = 0;
-  for (let y = 0; y < rows; y++) {
-    for (let x = 0; x < cols; x++) {
+  for (let y = 0; y < rows && idx < PARTICLE_COUNT; y++) {
+    for (let x = 0; x < cols && idx < PARTICLE_COUNT; x++) {
       const di = (y * cols + x) * 4;
-      targets[idx*3]   = (x - cols / 2) * spacing;
-      targets[idx*3+1] = -(y - rows / 2) * spacing;
-      targets[idx*3+2] = (Math.random() - 0.5) * 1.2;
       // 提亮补偿贴图边缘透明衰减
-      colors[idx*3]   = Math.min(1, px[di]     / 255 * 1.28);
-      colors[idx*3+1] = Math.min(1, px[di + 1] / 255 * 1.28);
-      colors[idx*3+2] = Math.min(1, px[di + 2] / 255 * 1.28);
-      idx++;
+      const cr = Math.min(1, px[di]     / 255 * 1.28);
+      const cg = Math.min(1, px[di + 1] / 255 * 1.28);
+      const cb = Math.min(1, px[di + 2] / 255 * 1.28);
+      const gx = (x - cols / 2 + 0.5) * spacing;
+      const gy = -(y - rows / 2 + 0.5) * spacing;
+      for (let f = 0; f < 4 && idx < PARTICLE_COUNT; f++, idx++) {
+        const th = f * Math.PI / 2;
+        const cos = Math.cos(th), sin = Math.sin(th);
+        const pz = R + (Math.random() - 0.5) * 0.8;
+        targets[idx*3]   = gx * cos + pz * sin;
+        targets[idx*3+1] = gy;
+        targets[idx*3+2] = -gx * sin + pz * cos;
+        colors[idx*3] = cr; colors[idx*3+1] = cg; colors[idx*3+2] = cb;
+      }
     }
   }
-  // 余下的粒子随机叠在已有像素上,增加厚度
+  // 余下的粒子随机叠在已有点上,增加厚度
   const used = idx;
   for (; idx < PARTICLE_COUNT; idx++) {
     const j = (Math.random() * used) | 0;
     targets[idx*3]   = targets[j*3];
     targets[idx*3+1] = targets[j*3+1];
-    targets[idx*3+2] = (Math.random() - 0.5) * 1.2;
+    targets[idx*3+2] = targets[j*3+2] + (Math.random() - 0.5) * 0.8;
     colors[idx*3] = colors[j*3]; colors[idx*3+1] = colors[j*3+1]; colors[idx*3+2] = colors[j*3+2];
   }
   geometry.attributes.color.needsUpdate = true;
@@ -422,12 +421,29 @@ function sampleTextPoints(lines, big) {
     }
   }
 
-  // 缩放到可视区域
+  // 缩放到可视区域(四面结构旋转时侧面会突向镜头,留出余量)
   const visH = 2 * camera.position.z * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
   const visW = visH * camera.aspect;
-  const scale = Math.min(visW * 0.86 / c.width, visH * 0.62 / c.height);
+  const scale = Math.min(visW * 0.72 / c.width, visH * 0.52 / c.height);
   for (const p of pts) { p[0] *= scale; p[1] *= scale; }
   return pts;
+}
+
+// 把采样点排成前/后/左/右四面结构(绕 Y 轴每 90° 一面),粒子按 1/4 分给每个面
+function assignFourSided(pts) {
+  let wHalf = 0;
+  for (const p of pts) wHalf = Math.max(wHalf, Math.abs(p[0]));
+  const R = wHalf * 1.02 + 2; // 面到中心的距离,四面正好围成方盒
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    const p = pts[(i >> 2) % pts.length];
+    const th = (i & 3) * Math.PI / 2;
+    const cos = Math.cos(th), sin = Math.sin(th);
+    const px = p[0] + (Math.random() - 0.5) * 0.5;
+    const pz = R + (Math.random() - 0.5) * 1.5;
+    targets[i*3]   = px * cos + pz * sin;
+    targets[i*3+1] = p[1] + (Math.random() - 0.5) * 0.5;
+    targets[i*3+2] = -px * sin + pz * cos;
+  }
 }
 
 function setTextTargets(text) {
@@ -442,12 +458,7 @@ function setTextTargets(text) {
   }
   const pts = sampleTextPoints(lines, text.length <= 2);
   if (!pts.length) return;
-  for (let i = 0; i < PARTICLE_COUNT; i++) {
-    const p = pts[i % pts.length];
-    targets[i*3]   = p[0] + (Math.random() - 0.5) * 0.5;
-    targets[i*3+1] = p[1] + (Math.random() - 0.5) * 0.5;
-    targets[i*3+2] = (Math.random() - 0.5) * 3;
-  }
+  assignFourSided(pts); // 数字/文字排成前后左右四面结构
 }
 
 function setFloatTargets() {
@@ -469,6 +480,12 @@ let mode = 'normal';
 let compress = 0;          // 压缩系数 0~1(平滑)
 let compressTarget = 0;
 let twoHandsActive = false; // 双手交互中:粒子运动实时跟随手速
+
+/* 四面结构 360° 旋转 */
+let structRot = 0;          // 当前旋转角
+let rotVel = 0.35;          // 角速度 rad/s
+const BASE_ROT_VEL = 0.35;  // 基础自转速度
+let prevPalmX = null;       // 掌心水平位置(移动手掌控制旋转)
 let orbFrames = 0;         // 处于对握距离内的帧数
 let orbLostFrames = 0;     // 对握状态下丢失双手的帧数(超时自动泄压)
 let orbReady = false;      // 已进入"对握最小"状态
@@ -490,13 +507,15 @@ function switchDisplay(d) {
     else if (d === 'msg') setTextTargets('__MSG__');
     else setTextTargets(d);
   }
-  // 照片模式:普通混合 + 实心圆点还原真实色彩;其余模式:加法混合 + 发光贴图
+  // 照片模式:普通混合 + 实心圆点 + 深度写入(四面结构旋转时前面正确遮挡后面);其余模式:加法混合 + 发光贴图
   const isPhoto = display === 'photo';
   const blend = isPhoto ? THREE.NormalBlending : THREE.AdditiveBlending;
   const map = isPhoto ? photoSpriteTex : glowSpriteTex;
   if (material.blending !== blend || material.map !== map) {
     material.blending = blend;
     material.map = map;
+    material.depthWrite = isPhoto;
+    material.alphaTest = isPhoto ? 0.4 : 0;
     material.needsUpdate = true;
   }
 }
@@ -525,6 +544,20 @@ function countFingers(lm) {
 function handleGestureFrame(results) {
   const hands = results.multiHandLandmarks || [];
   twoHandsActive = hands.length === 2 && mode !== 'explode' && mode !== 'message';
+
+  // 掌心水平移动 → 拨动四面结构旋转(像转转盘)
+  if (hands.length >= 1) {
+    const palmX = hands[0][9].x;
+    if (prevPalmX !== null) {
+      const dx = palmX - prevPalmX;
+      if (Math.abs(dx) < 0.25) { // 防手切换/瞬移误判
+        rotVel = THREE.MathUtils.clamp(rotVel + dx * 22, -3.5, 3.5);
+      }
+    }
+    prevPalmX = palmX;
+  } else {
+    prevPalmX = null;
+  }
 
   /* ---------- 双手:压缩/对握/爆炸 状态机 ---------- */
   if (hands.length === 2 && mode !== 'explode' && mode !== 'message') {
@@ -637,14 +670,26 @@ function animate() {
       switchDisplay('photo'); // 爆炸后汇聚成人物粒子画像(照片没加载好会自动退回文字)
     }
   } else {
+    // 四面结构持续 360° 环绕旋转(掌心移动可加速/反向,松手回归匀速)
+    structRot += rotVel * dt;
+    rotVel += (BASE_ROT_VEL - rotVel) * 0.02;
+    const rotating = display !== '' && display !== 'float';
+    const cR = Math.cos(structRot), sR = Math.sin(structRot);
+
     // 缓动飞向目标(带压缩);双手交互时用高追踪系数,粒子紧贴手的快慢
-    const k = twoHandsActive ? 0.35 : (display === 'float' ? 0.025 : 0.07);
+    const k = twoHandsActive ? 0.35 : (display === 'float' ? 0.025 : 0.09);
     const shrink = 1 - compress * 0.93;
     const jitter = compress > 0.9 ? 0.5 : 0; // 蓄能颤动
     for (let i = 0; i < PARTICLE_COUNT; i++) {
-      let tx = targets[i*3] * shrink;
-      let ty = targets[i*3+1] * shrink;
-      let tz = targets[i*3+2] * shrink;
+      let tx = targets[i*3];
+      let ty = targets[i*3+1];
+      let tz = targets[i*3+2];
+      if (rotating) { // 绕 Y 轴旋转四面结构
+        const rx = tx * cR + tz * sR;
+        tz = -tx * sR + tz * cR;
+        tx = rx;
+      }
+      tx *= shrink; ty *= shrink; tz *= shrink;
       if (display === 'float') {
         // 星空缓慢漂浮
         tx += Math.sin(t * 0.3 + phase[i]) * 2.5;
