@@ -113,7 +113,7 @@ const IS_MOBILE = /iPhone|iPad|Android/i.test(navigator.userAgent)
   || (navigator.maxTouchPoints > 1 && /Mac/.test(navigator.userAgent)); // iPadOS 伪装 Mac
 const PARTICLE_COUNT = IS_MOBILE ? 12000 : 22000;
 const STABLE_FRAMES = 15;         // 手势稳定帧数(约0.5s)
-const ORB_DIST      = 0.13;       // 双手对握距离阈值(归一化)
+const ORB_DIST      = 0.22;       // 双手对握距离阈值(归一化;太小时两手重叠会丢检测)
 const COMPRESS_MAX_DIST = 0.55;   // 开始压缩的最大距离
 const EXPLODE_SPEED = 0.028;      // 触发爆炸的双手分离速度(每帧)
 
@@ -459,6 +459,7 @@ let compress = 0;          // 压缩系数 0~1(平滑)
 let compressTarget = 0;
 let twoHandsActive = false; // 双手交互中:粒子运动实时跟随手速
 let orbFrames = 0;         // 处于对握距离内的帧数
+let orbLostFrames = 0;     // 对握状态下丢失双手的帧数(超时自动泄压)
 let orbReady = false;      // 已进入"对握最小"状态
 let prevHandDist = null;
 let explodeTime = 0;
@@ -497,14 +498,16 @@ let candidateFrames = 0;
 let stableGesture = 0;
 
 function countFingers(lm) {
+  // 距离比值判断,与手的旋转角度无关
+  const D = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  const wrist = lm[0];
   let n = 0;
-  // 食指/中指/无名指/小指: 指尖高于 PIP 关节(图像 y 向下)
-  for (const tip of [8, 12, 16, 20]) {
-    if (lm[tip].y < lm[tip - 2].y) n++;
+  // 四指:伸直时指尖到手腕的距离明显大于第二关节(PIP)到手腕的距离;弯曲时反之
+  for (const [tip, pip] of [[8, 6], [12, 10], [16, 14], [20, 18]]) {
+    if (D(lm[tip], wrist) > D(lm[pip], wrist) * 1.15) n++;
   }
-  // 拇指: 与镜像/左右手无关的判断 —— 拇指伸展方向与"食指根→小指根"方向相反
-  const dir = Math.sign(lm[5].x - lm[17].x); // 手掌朝向
-  if (dir !== 0 && (lm[4].x - lm[3].x) * dir > 0.02) n++;
+  // 拇指:张开时指尖远离小指根(17),收拢时贴近手掌
+  if (D(lm[4], lm[17]) > D(lm[3], lm[17]) * 1.15) n++;
   return n;
 }
 
@@ -523,27 +526,34 @@ function handleGestureFrame(results) {
 
     if (d < ORB_DIST) {
       orbFrames++;
-      if (orbFrames > 6) { orbReady = true; mode = 'orb'; }
+      if (orbFrames >= 4) { orbReady = true; mode = 'orb'; }
     } else {
       orbFrames = 0;
     }
 
-    // 必须先对握到最小,再快速分开才爆炸
-    if (orbReady && prevHandDist !== null && (d - prevHandDist) > EXPLODE_SPEED && d > ORB_DIST * 1.4) {
+    // 爆炸(必须先对握):快速分开,或对握后双手重新出现时已经明显分开
+    if (orbReady && (
+      (prevHandDist !== null && (d - prevHandDist) > EXPLODE_SPEED && d > ORB_DIST * 1.3) ||
+      d > 0.34
+    )) {
       triggerExplosion();
     }
     prevHandDist = d;
+    orbLostFrames = 0;
     candidateGesture = -1; candidateFrames = 0; // 双手时不做单手识别
     return;
   }
 
-  // 双手离开: 复位压缩(爆炸/展示阶段不干预)
-  if (mode === 'orb' && hands.length < 2) {
-    // 对握后手移出画面: 缓慢泄压
-    orbFrames = 0;
-    if (compress < 0.15) { mode = 'normal'; orbReady = false; }
+  // 双手握到一起时检测器经常丢手(两手重叠)——刚才还在双手压缩且压得足够紧时,丢手视为"对握完成"
+  if (hands.length < 2 && mode !== 'explode' && mode !== 'message') {
+    if (!orbReady && compress > 0.7 && prevHandDist !== null) { orbReady = true; mode = 'orb'; }
   }
-  if (mode === 'normal') { compressTarget = 0; orbReady = false; orbFrames = 0; prevHandDist = null; }
+  if (mode === 'orb' && hands.length < 2) {
+    orbFrames = 0;
+    orbLostFrames++;
+    if (orbLostFrames > 75) { mode = 'normal'; orbReady = false; } // 约3秒没等到双手重新出现,自动泄压
+  }
+  if (mode === 'normal') { compressTarget = 0; orbReady = false; orbFrames = 0; prevHandDist = null; orbLostFrames = 0; }
   if (mode === 'orb') compressTarget = 1;
 
   /* ---------- 单手:手指数 → 文字 ---------- */
@@ -691,6 +701,38 @@ const loading = document.getElementById('loading');
 const errMsg = document.getElementById('errMsg');
 let modelLoaded = false;
 
+function setLoading(text) { loading.textContent = text; }
+
+// 带进度预下载模型文件(下载进浏览器 HTTP 缓存,MediaPipe 随后加载时直接命中,不会重复下载)
+async function prefetchModelFiles() {
+  // 检测 WASM SIMD 支持,只下载会用到的那套文件
+  const simd = WebAssembly.validate(new Uint8Array([
+    0,97,115,109,1,0,0,0,1,5,1,96,0,1,123,3,2,1,0,10,10,1,8,0,65,0,253,15,253,98,11
+  ]));
+  const files = [
+    simd ? 'hands_solution_simd_wasm_bin.js'   : 'hands_solution_wasm_bin.js',
+    simd ? 'hands_solution_simd_wasm_bin.wasm' : 'hands_solution_wasm_bin.wasm',
+    'hands_solution_packed_assets_loader.js',
+    'hands_solution_packed_assets.data',
+    'hands.binarypb',
+    'hand_landmark_lite.tflite',
+  ];
+  let got = 0, total = 0;
+  await Promise.all(files.map(async f => {
+    const resp = await fetch('./vendor/hands/' + f);
+    if (!resp.ok) throw new Error('模型文件下载失败: ' + f + ' (HTTP ' + resp.status + ')');
+    total += +resp.headers.get('Content-Length') || 0;
+    if (!resp.body) { await resp.arrayBuffer(); got = total; return; } // 旧浏览器无流式读取
+    const reader = resp.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      got += value.length;
+      if (total) setLoading('模型下载中 ' + Math.min(99, Math.round(got / total * 100)) + '%(首次约13MB,请耐心等待)');
+    }
+  }));
+}
+
 startBtn.addEventListener('click', async () => {
   overlay.classList.add('hide');
   loading.classList.add('show');
@@ -700,39 +742,62 @@ startBtn.addEventListener('click', async () => {
     return;
   }
 
+  const video = document.getElementById('video');
+  const hands = new Hands({
+    locateFile: f => `./vendor/hands/${f}`,
+  });
+  hands.setOptions({
+    maxNumHands: 2,
+    modelComplexity: 0,        // 移动端流畅优先
+    minDetectionConfidence: 0.5, // 放宽,减少双手靠近时丢检测
+    minTrackingConfidence: 0.5,
+    selfieMode: true,          // 与镜像预览一致
+  });
+  hands.onResults(results => {
+    if (!modelLoaded) {
+      modelLoaded = true;
+      loading.classList.remove('show');
+      document.getElementById('hint').classList.add('show');
+    }
+    handleGestureFrame(results);
+  });
+
+  // 1) 下载模型(带进度)
   try {
-    const video = document.getElementById('video');
+    setLoading('模型下载中…');
+    await prefetchModelFiles();
+  } catch (err) {
+    showError('模型下载失败:' + (err && err.message ? err.message : err) + '\n请检查网络后刷新页面重试。');
+    return;
+  }
 
-    const hands = new Hands({
-      locateFile: f => `./vendor/hands/${f}`,
-    });
-    hands.setOptions({
-      maxNumHands: 2,
-      modelComplexity: 0,        // 移动端流畅优先
-      minDetectionConfidence: 0.6,
-      minTrackingConfidence: 0.5,
-      selfieMode: true,          // 与镜像预览一致
-    });
-    hands.onResults(results => {
-      if (!modelLoaded) {
-        modelLoaded = true;
-        loading.classList.remove('show');
-        document.getElementById('camWrap').classList.add('show');
-        document.getElementById('hint').classList.add('show');
-      }
-      handleGestureFrame(results);
-    });
+  // 2) 初始化 WASM 识别引擎
+  try {
+    setLoading('模型初始化中…');
+    await hands.initialize();
+  } catch (err) {
+    showError('模型初始化失败:' + (err && err.message ? err.message : err) + '\n请刷新页面重试,建议使用 Safari。');
+    return;
+  }
 
+  // 3) 启动摄像头
+  try {
+    setLoading('摄像头启动中…');
     const cam = new Camera(video, {
-      onFrame: async () => { await hands.send({ image: video }); },
+      onFrame: async () => { try { await hands.send({ image: video }); } catch (e) {} },
       width: 640,
       height: 480,
       facingMode: 'user',
     });
     await cam.start();
+    document.getElementById('camWrap').classList.add('show'); // 小窗立即显示,便于确认摄像头正常
+    setLoading('请把手放入镜头画面');
+    setTimeout(() => {
+      if (!modelLoaded) setLoading('迟迟无响应?请刷新页面重试,或改用 Safari 打开');
+    }, 25000);
   } catch (err) {
     showError('摄像头启动失败:' + (err && err.message ? err.message : err) +
-      '\n请确认已允许摄像头权限,并使用 Safari/Chrome 通过 HTTPS 访问。');
+      '\n请确认已允许摄像头权限(设置→Safari→摄像头),建议用 Safari 打开。');
   }
 });
 
