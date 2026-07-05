@@ -280,7 +280,8 @@ function spawnBalloon() {
   const b = balloons.find(x => !x.userData.active);
   if (!b) return;
   const u = b.userData;
-  const z = -26 + Math.random() * 20; // 在文字后方升起,不遮字
+  // 文字模式:气球在文字后方升起,不遮字;照片铺满全屏时:气球飘在照片前面
+  const z = display === 'photo' ? 4 + Math.random() * 12 : -26 + Math.random() * 20;
   const dist = camera.position.z - z;
   const halfH = dist * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
   const halfW = halfH * camera.aspect;
@@ -330,19 +331,29 @@ let photoDotSize = 0.6; // 照片模式的粒子尺寸(按网格间距算出)
 
 function setPhotoTargets() {
   if (!photoReady) return false;
-  const aspect = photoImg.naturalWidth / photoImg.naturalHeight;
-  let rows = Math.floor(Math.sqrt(PARTICLE_COUNT / aspect));
-  let cols = Math.floor(rows * aspect);
+  const visH = 2 * camera.position.z * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+  const visW = visH * camera.aspect;
+  // 粒子网格按屏幕比例分布,铺满全屏
+  let rows = Math.floor(Math.sqrt(PARTICLE_COUNT * visH / visW));
+  let cols = Math.floor(rows * visW / visH);
   while (rows * cols > PARTICLE_COUNT) rows--;
+  // 照片按 cover 方式裁剪:短边撑满,超出部分裁掉(横竖屏都全屏)
+  const pw = photoImg.naturalWidth, ph = photoImg.naturalHeight;
+  const screenAspect = visW / visH;
+  let sx, sy, srcW, srcH;
+  if (pw / ph > screenAspect) {
+    srcH = ph; srcW = ph * screenAspect; sx = (pw - srcW) / 2; sy = 0;
+  } else {
+    srcW = pw; srcH = pw / screenAspect; sx = 0;
+    sy = (ph - srcH) * 0.32; // 竖图裁上下时偏向上方,保住脸部
+  }
   const c = document.createElement('canvas');
   c.width = cols; c.height = rows;
   const g = c.getContext('2d');
-  g.drawImage(photoImg, 0, 0, cols, rows);
+  g.drawImage(photoImg, sx, sy, srcW, srcH, 0, 0, cols, rows);
   const px = g.getImageData(0, 0, cols, rows).data;
 
-  const visH = 2 * camera.position.z * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
-  const visW = visH * camera.aspect;
-  const spacing = Math.min(visH * 0.82 / rows, visW * 0.92 / cols);
+  const spacing = visH / rows; // rows×spacing = 可视高度,正好铺满
   photoDotSize = spacing * 2.0; // 点径大于间距,相互衔接铺满画面
 
   let idx = 0;
@@ -688,7 +699,9 @@ function onResize() {
   }
 }
 window.addEventListener('resize', onResize);
-window.addEventListener('orientationchange', () => setTimeout(onResize, 300));
+// 横竖屏旋转:不同浏览器时序不一,多补两次确保排版刷新
+window.addEventListener('orientationchange', () => { setTimeout(onResize, 300); setTimeout(onResize, 900); });
+if (window.visualViewport) window.visualViewport.addEventListener('resize', onResize);
 document.addEventListener('dblclick', e => e.preventDefault(), { passive: false });
 document.addEventListener('gesturestart', e => e.preventDefault(), { passive: false });
 
